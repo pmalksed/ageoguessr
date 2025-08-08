@@ -16,7 +16,8 @@ from flask import Flask, jsonify, request, send_from_directory, render_template
 from config import (
     BIRTH_DATE,
     MEDIA_DIR,
-    TURN_DURATION_SECONDS,
+    TURN_DURATION_SECONDS_VIDEO,
+    TURN_DURATION_SECONDS_IMAGE,
     TOTAL_ROUNDS,
     ALLOWED_IMAGE_EXTENSIONS,
     ALLOWED_VIDEO_EXTENSIONS,
@@ -37,6 +38,18 @@ app = Flask(__name__, static_folder="static", template_folder="templates")
 
 # Reveal phase duration in seconds
 REVEAL_SECONDS = 5
+
+# Compute birth date in local timezone date form to compare against capture dates
+def _local_date(dt: datetime):
+    try:
+        local_tz = datetime.now().astimezone().tzinfo
+        if dt.tzinfo is not None:
+            return dt.astimezone(local_tz).date()
+        return dt.date()
+    except Exception:
+        return dt.date()
+
+BIRTH_LOCAL_DATE = _local_date(BIRTH_DATE)
 
 
 @dataclass
@@ -62,7 +75,8 @@ class GameState:
     active: bool = False
     game_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     total_rounds: int = TOTAL_ROUNDS
-    turn_duration_seconds: int = TURN_DURATION_SECONDS
+    # Duration for the CURRENT round only; set when round starts
+    current_turn_duration_seconds: int = TURN_DURATION_SECONDS_IMAGE
     current_round_index: int = 0
     rounds_remaining: int = TOTAL_ROUNDS
     current_round: Optional[RoundInfo] = None
@@ -86,7 +100,7 @@ class GameState:
         self.active = False
         self.game_id = uuid.uuid4().hex
         self.total_rounds = TOTAL_ROUNDS
-        self.turn_duration_seconds = TURN_DURATION_SECONDS
+        self.current_turn_duration_seconds = TURN_DURATION_SECONDS_IMAGE
         self.current_round_index = 0
         self.rounds_remaining = TOTAL_ROUNDS
         self.current_round = None
@@ -246,12 +260,20 @@ def _capture_datetime_via_good_methods(path: Path) -> Optional[datetime]:
     return None
 
 
+def _age_days_from_dt(capture_dt: datetime) -> int:
+    try:
+        capture_local_date = _local_date(capture_dt)
+        diff_days = (capture_local_date - BIRTH_LOCAL_DATE).days
+        return max(0, diff_days)
+    except Exception:
+        return 0
+
+
 def _age_in_days_for_media_good_only(path: Path) -> Optional[int]:
     dt = _capture_datetime_via_good_methods(path)
     if not dt:
         return None
-    delta = dt - BIRTH_DATE
-    return max(0, int(delta.total_seconds() // 86400))
+    return _age_days_from_dt(dt)
 
 
 def _age_in_days_for_media_with_fallback(path: Path) -> Optional[int]:
@@ -262,8 +284,7 @@ def _age_in_days_for_media_with_fallback(path: Path) -> Optional[int]:
         dt = _parse_datetime_from_filename(str(path))
     if not dt:
         return None
-    delta = dt - BIRTH_DATE
-    return max(0, int(delta.total_seconds() // 86400))
+    return _age_days_from_dt(dt)
 
 
 def _pick_random_media() -> Optional[Tuple[str, str, int]]:
@@ -298,13 +319,16 @@ def _pick_random_media() -> Optional[Tuple[str, str, int]]:
 def _start_next_round_locked():
     global STATE
     pick = _pick_random_media()
-    guess_ends_at = _now() + timedelta(seconds=STATE.turn_duration_seconds)
+    # Determine duration based on media type once we know it
+    duration_seconds = TURN_DURATION_SECONDS_IMAGE
 
     STATE.current_round_index += 1
     STATE.rounds_remaining = max(0, STATE.total_rounds - STATE.current_round_index)
 
     if pick is None:
         # No media, still advance the timer so clients can see countdown; media fields None
+        STATE.current_turn_duration_seconds = duration_seconds
+        guess_ends_at = _now() + timedelta(seconds=duration_seconds)
         STATE.current_round = RoundInfo(
             round_index=STATE.current_round_index,
             media_filename=None,
@@ -316,6 +340,9 @@ def _start_next_round_locked():
         )
     else:
         filename, media_type, age_days = pick
+        duration_seconds = TURN_DURATION_SECONDS_VIDEO if media_type == "video" else TURN_DURATION_SECONDS_IMAGE
+        STATE.current_turn_duration_seconds = duration_seconds
+        guess_ends_at = _now() + timedelta(seconds=duration_seconds)
         STATE.current_round = RoundInfo(
             round_index=STATE.current_round_index,
             media_filename=filename,
@@ -582,7 +609,7 @@ def get_state():
                 "round_number": STATE.current_round_index,
                 "total_rounds": STATE.total_rounds,
                 "rounds_remaining": STATE.rounds_remaining,
-                "turn_duration_seconds": STATE.turn_duration_seconds,
+                "turn_duration_seconds": STATE.current_turn_duration_seconds,
                 "turn_ends_at_ms": int(next_deadline.timestamp() * 1000) if next_deadline else None,
                 "media_url": media_url,
                 "media_type": rnd.media_type if rnd else None,
