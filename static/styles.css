@@ -52,6 +52,59 @@ body {
   font-size: 14px;
 }
 
+/* Circular timer */
+.circular-timer {
+  position: relative;
+  width: 48px;
+  height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.timer-circle {
+  position: absolute;
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  background: conic-gradient(from 270deg, #ff8fcf var(--progress, 0%), #e0e0e0 var(--progress, 0%));
+  transition: background 0.1s ease;
+}
+
+.timer-circle.urgent {
+  animation: urgentPulse 1s infinite;
+}
+
+@keyframes urgentPulse {
+  0%, 100% { 
+    background: conic-gradient(from 270deg, #ff4444 var(--progress, 0%), #e0e0e0 var(--progress, 0%));
+    box-shadow: 0 0 0 0 rgba(255, 68, 68, 0.7);
+  }
+  50% { 
+    background: conic-gradient(from 270deg, #ff8888 var(--progress, 0%), #e0e0e0 var(--progress, 0%));
+    box-shadow: 0 0 0 4px rgba(255, 68, 68, 0);
+  }
+}
+
+.timer-inner {
+  position: relative;
+  z-index: 1;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.95);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 700;
+  color: #7a3f73;
+}
+
+.timer-inner.urgent {
+  color: #ff4444;
+}
+
 .media-stage {
   flex: 1;
   display: flex;
@@ -252,6 +305,16 @@ input[type="range"].has-guess::-moz-range-thumb {
   .brand { font-size: 16px; }
   .header .prompt { font-size: 13px; }
   .timer { font-size: 13px; }
+
+  .circular-timer {
+    width: 40px;
+    height: 40px;
+  }
+  .timer-inner {
+    width: 30px;
+    height: 30px;
+    font-size: 10px;
+  }
 
   .media-stage { padding: 8px; }
   .media-box { max-height: 52vh; }

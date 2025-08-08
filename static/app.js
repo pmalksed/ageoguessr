@@ -9,9 +9,20 @@ function msToClock(ms) {
 }
 
 function daysToMonthsDays(days) {
-  // Approx conversion: 30.44 days per month
-  const months = Math.floor(days / 30.44);
-  const remDays = Math.round(days - months * 30.44);
+  // Align ticks to average month length so marks and labels match better
+  const avgMonth = 365 / 12; // ≈30.4167
+  const monthsFloat = days / avgMonth;
+  let months = Math.floor(monthsFloat + 1e-9);
+  let remainder = days - months * avgMonth;
+  let remDays = Math.round(remainder);
+  const avgMonthRounded = Math.round(avgMonth);
+  if (remDays >= avgMonthRounded) {
+    months += 1;
+    remDays = 0;
+  }
+  // Clamp to 0..12 months
+  if (months > 12) { months = 12; remDays = 0; }
+  if (months < 0) { months = 0; }
   return { months, days: remDays };
 }
 
@@ -52,6 +63,22 @@ function useRegistration() {
   };
 
   return { player, setPlayer, updateUsername };
+}
+
+function CircularTimer({ endsAtMs, totalDurationMs, nowMs }) {
+  const deltaMs = endsAtMs ? Math.max(0, endsAtMs - nowMs) : 0;
+  const progress = totalDurationMs > 0 ? Math.max(0, Math.min(100, ((totalDurationMs - deltaMs) / totalDurationMs) * 100)) : 0;
+  const isUrgent = deltaMs <= 3000 && deltaMs > 0;
+  
+  const timeText = endsAtMs ? msToClock(deltaMs) : "--:--";
+  
+  return React.createElement("div", { className: "circular-timer" },
+    React.createElement("div", { 
+      className: `timer-circle ${isUrgent ? "urgent" : ""}`,
+      style: { "--progress": `${progress}%` }
+    }),
+    React.createElement("div", { className: `timer-inner ${isUrgent ? "urgent" : ""}` }, timeText)
+  );
 }
 
 function App() {
@@ -136,7 +163,7 @@ function App() {
   }, [state, player]);
 
   const endsAt = state?.game?.turn_ends_at_ms ?? null;
-  const deltaMs = endsAt ? Math.max(0, endsAt - nowMs) : 0;
+  const totalDurationMs = (state?.game?.turn_duration_seconds || 0) * 1000;
 
   const mediaUrl = state?.game?.media_url ?? null;
   const mediaType = state?.game?.media_type ?? null;
@@ -208,7 +235,7 @@ function App() {
         React.createElement("div", { className: "panel header" },
           React.createElement("div", { className: "brand" }, "ageoguessr"),
           React.createElement("div", { className: "prompt" }, promptText),
-          React.createElement("div", { className: "timer" }, endsAt ? msToClock(deltaMs) : "--:--")
+          phase !== "reveal" && React.createElement(CircularTimer, { endsAtMs: endsAt, totalDurationMs, nowMs })
         ),
         React.createElement("div", { className: "panel username-box username-mobile" },
           React.createElement("span", null, "Username:"),
@@ -330,7 +357,7 @@ function GuessControl({ disabled, guessDays, onChange, onCommit, reveal = false,
     for (const [pid, r] of Object.entries(results)) {
       const d = r.guess_days;
       if (typeof d !== "number") continue;
-      dots.push({ value: d, color: pid === myId ? "#ff69b4" : "#4aa3ff", size: 10, key: `g-${pid}` });
+      dots.push({ value: d, color: "#4aa3ff", size: 10, key: `g-${pid}` });
     }
     if (typeof trueDays === "number") {
       dots.push({ value: trueDays, color: "#ffd400", size: 14, key: "true" });

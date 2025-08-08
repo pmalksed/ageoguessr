@@ -16,7 +16,8 @@ from flask import Flask, jsonify, request, send_from_directory, render_template
 from config import (
     BIRTH_DATE,
     MEDIA_DIR,
-    TURN_DURATION_SECONDS,
+    TURN_DURATION_SECONDS_IMAGE,
+    TURN_DURATION_SECONDS_VIDEO,
     TOTAL_ROUNDS,
     ALLOWED_IMAGE_EXTENSIONS,
     ALLOWED_VIDEO_EXTENSIONS,
@@ -62,7 +63,8 @@ class GameState:
     active: bool = False
     game_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     total_rounds: int = TOTAL_ROUNDS
-    turn_duration_seconds: int = TURN_DURATION_SECONDS
+    # Duration for the CURRENT round only; set when round starts
+    current_turn_duration_seconds: int = TURN_DURATION_SECONDS_IMAGE
     current_round_index: int = 0
     rounds_remaining: int = TOTAL_ROUNDS
     current_round: Optional[RoundInfo] = None
@@ -86,7 +88,7 @@ class GameState:
         self.active = False
         self.game_id = uuid.uuid4().hex
         self.total_rounds = TOTAL_ROUNDS
-        self.turn_duration_seconds = TURN_DURATION_SECONDS
+        self.current_turn_duration_seconds = TURN_DURATION_SECONDS_IMAGE
         self.current_round_index = 0
         self.rounds_remaining = TOTAL_ROUNDS
         self.current_round = None
@@ -298,13 +300,16 @@ def _pick_random_media() -> Optional[Tuple[str, str, int]]:
 def _start_next_round_locked():
     global STATE
     pick = _pick_random_media()
-    guess_ends_at = _now() + timedelta(seconds=STATE.turn_duration_seconds)
+    # Determine duration based on media type once we know it
+    duration_seconds = TURN_DURATION_SECONDS_IMAGE
 
     STATE.current_round_index += 1
     STATE.rounds_remaining = max(0, STATE.total_rounds - STATE.current_round_index)
 
     if pick is None:
         # No media, still advance the timer so clients can see countdown; media fields None
+        STATE.current_turn_duration_seconds = duration_seconds
+        guess_ends_at = _now() + timedelta(seconds=duration_seconds)
         STATE.current_round = RoundInfo(
             round_index=STATE.current_round_index,
             media_filename=None,
@@ -316,6 +321,9 @@ def _start_next_round_locked():
         )
     else:
         filename, media_type, age_days = pick
+        duration_seconds = TURN_DURATION_SECONDS_VIDEO if media_type == "video" else TURN_DURATION_SECONDS_IMAGE
+        STATE.current_turn_duration_seconds = duration_seconds
+        guess_ends_at = _now() + timedelta(seconds=duration_seconds)
         STATE.current_round = RoundInfo(
             round_index=STATE.current_round_index,
             media_filename=filename,
@@ -516,7 +524,7 @@ def join_game():
     return jsonify({"ok": True})
 
 
-@app.route("/api/ready", methods=["POST"])
+@app.route("/api/ready", methods=["POST"]) 
 def set_ready():
     data = request.get_json(silent=True) or {}
     player_id = data.get("player_id")
@@ -582,7 +590,7 @@ def get_state():
                 "round_number": STATE.current_round_index,
                 "total_rounds": STATE.total_rounds,
                 "rounds_remaining": STATE.rounds_remaining,
-                "turn_duration_seconds": STATE.turn_duration_seconds,
+                "turn_duration_seconds": STATE.current_turn_duration_seconds,
                 "turn_ends_at_ms": int(next_deadline.timestamp() * 1000) if next_deadline else None,
                 "media_url": media_url,
                 "media_type": rnd.media_type if rnd else None,
