@@ -382,7 +382,10 @@ function GuessControl({ disabled, guessDays, onChange, onCommit, reveal = false,
         disabled,
       }),
       React.createElement("div", { className: "ticks" },
-        marks.map((m) => React.createElement("span", { key: m }, `${m}m`))
+        marks.map((m, index) => React.createElement("span", { 
+          key: m, 
+          style: { transform: `translateX(${index === marks.length - 1 ? 8 : (index / (marks.length - 1)) * 16}px)` }
+        }, `${m}m`))
       ),
       React.createElement("div", { className: "range-label" }, disabled ? "Make a guess when the game starts" : (hasGuess ? `Your guess is: ${label}` : "Pick an age..."))
     )
