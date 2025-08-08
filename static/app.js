@@ -248,7 +248,7 @@ function App() {
                 ? React.createElement("video", { src: mediaUrl, controls: true, autoPlay: true, loop: true })
                 : React.createElement("img", { src: mediaUrl, alt: "current" })
             ) : (
-              React.createElement("div", null, "Type 'newgame' to start! Put media in the server's media folder.")
+              null
             )
           ),
           phase === "reveal" && React.createElement(RevealOverlay, { state, player })
@@ -283,7 +283,6 @@ function App() {
               bump && row.player_id === myRowId && React.createElement("span", { className: "score-bump", style: { position: 'absolute', right: 10, top: -2 } }, `+${bump.points}`)
             )
           )),
-          React.createElement("div", { className: "footer-hint" }, "Psst: type 'newgame' to start a fresh 50-round game.")
         )
       )
     )
