@@ -83,7 +83,8 @@ function CircularTimer({ endsAtMs, totalDurationMs, nowMs }) {
 
 function App() {
   const { player, updateUsername } = useRegistration();
-  const [state, setState] = useState(null);
+  const [state, setState] = useState(null); // full state
+  const [light, setLight] = useState(null); // poll snapshot
   const [nowMs, setNowMs] = useState(Date.now());
   const [tempGuessDays, setTempGuessDays] = useState(null);
   const lastSentGuessRef = useRef(null);
@@ -93,8 +94,8 @@ function App() {
   const [myScore, setMyScore] = useState(0);
   const [bump, setBump] = useState(null); // {points}
 
-  // Track last seen round/phase to trigger animations
-  const lastRoundRef = useRef({ round: 0, phase: "" });
+  // Track last seen round/phase/epoch to decide when to fetch full state
+  const lastPollRef = useRef({ epoch: 0, gameId: null, round: 0, phase: "" });
 
   // Media cache: versioned URL -> { blobUrl, type }
   const mediaCacheRef = useRef(new Map());
@@ -121,25 +122,43 @@ function App() {
     return blobUrl;
   }
 
-  function usePoll() {
-    useEffect(() => {
-      let active = true;
-      async function tick() {
-        try {
-          const data = await api("/api/state");
-          if (!active) return;
-          setState(data);
-          setNowMs(data.server_time_ms);
-        } catch (e) {
-          // ignore
+  // Poll /api/poll and only fetch /api/state when epoch/phase/round change
+  useEffect(() => {
+    let active = true;
+    async function tick() {
+      try {
+        const snap = await api("/api/poll");
+        if (!active) return;
+        setLight(snap);
+        setNowMs(snap.server_time_ms);
+        const changed = (
+          lastPollRef.current.epoch !== snap.state_epoch ||
+          lastPollRef.current.gameId !== snap.game_id ||
+          lastPollRef.current.round !== snap.round_number ||
+          lastPollRef.current.phase !== (snap.phase || "")
+        );
+        if (changed) {
+          lastPollRef.current = {
+            epoch: snap.state_epoch,
+            gameId: snap.game_id,
+            round: snap.round_number,
+            phase: snap.phase || "",
+          };
+          // Fetch full state exactly once per change
+          try {
+            const full = await api("/api/state");
+            if (!active) return;
+            setState(full);
+          } catch (e) {}
         }
+      } catch (e) {
+        // ignore
       }
-      tick();
-      const h = setInterval(tick, 1000);
-      return () => { active = false; clearInterval(h); };
-    }, []);
-  }
-  usePoll();
+    }
+    tick();
+    const h = setInterval(tick, 1000);
+    return () => { active = false; clearInterval(h); };
+  }, []);
 
   // Auto-join the current game when we have a player
   useEffect(() => {
@@ -155,12 +174,6 @@ function App() {
     api("/api/join", { method: "POST", body: JSON.stringify({ player_id: player.player_id }) }).catch(() => {});
   }, [state?.game?.game_id, player?.player_id]);
 
-  // Local clock
-  useEffect(() => {
-    const t = setInterval(() => setNowMs((v) => v + 250), 250);
-    return () => clearInterval(t);
-  }, []);
-
   // Update myScore and detect reveal start to animate bump
   useEffect(() => {
     if (!state || !player) return;
@@ -172,8 +185,7 @@ function App() {
 
     const round = state.game?.round_number || 0;
     const phase = state.game?.phase || "";
-    if (phase === "reveal" && (lastRoundRef.current.round !== round || lastRoundRef.current.phase !== "reveal")) {
-      lastRoundRef.current = { round, phase };
+    if (phase === "reveal") {
       // Compute my points from reveal block if present
       const results = state.game?.reveal?.results || {};
       const mine = results[player.player_id];
@@ -183,28 +195,28 @@ function App() {
       } else {
         setBump(null);
       }
-    } else {
-      lastRoundRef.current = { round, phase };
     }
   }, [state, player]);
 
-  const endsAt = state?.game?.turn_ends_at_ms ?? null;
+  const endsAt = (light?.turn_ends_at_ms ?? state?.game?.turn_ends_at_ms) ?? null;
   const totalDurationMs = (state?.game?.turn_duration_seconds || 0) * 1000;
 
   const serverMediaUrl = state?.game?.media_url ?? null;
   const mediaType = state?.game?.media_type ?? null;
-  const phase = state?.game?.phase ?? "";
+  const phaseLight = light?.phase || null;
+  const phaseFull = state?.game?.phase ?? null;
+  const phaseEffective = phaseLight || phaseFull || "";
   const babyName = state?.baby_name || "the baby";
   const mediaLabel = mediaType === "image" ? "photo" : (mediaType === "video" ? "video" : "media");
   const promptText = `How old is ${babyName} in this ${mediaLabel}?`;
 
-  // Prefetch pending during reveal
+  // Prefetch pending during reveal: requires full state (for URL)
   useEffect(() => {
     const pending = state?.game?.pending;
-    if (phase === "reveal" && pending?.media_url && pending?.media_type) {
+    if (phaseEffective === "reveal" && pending?.media_url && pending?.media_type) {
       prefetchToBlob(pending.media_url, pending.media_type).catch(() => {});
     }
-  }, [phase, state?.game?.pending?.media_url]);
+  }, [phaseEffective, state?.game?.pending?.media_url]);
 
   // Ensure current media is sourced from cache/blob
   useEffect(() => {
@@ -300,7 +312,7 @@ function App() {
         React.createElement("div", { className: "panel header" },
           React.createElement("div", { className: "brand" }, "ageoguessr"),
           React.createElement("div", { className: "prompt" }, promptText),
-          phase !== "reveal" && React.createElement(CircularTimer, { endsAtMs: endsAt, totalDurationMs, nowMs })
+          phaseEffective !== "reveal" && React.createElement(CircularTimer, { endsAtMs: endsAt, totalDurationMs, nowMs })
         ),
         React.createElement("div", { className: "panel username-box username-mobile" },
           React.createElement("span", null, "Username:"),
@@ -316,19 +328,19 @@ function App() {
               state?.game?.active ? React.createElement("div", null, "Loading media...") : null
             )
           ),
-          phase === "reveal" && React.createElement(RevealOverlay, { state, player })
+          phaseEffective === "reveal" && React.createElement(RevealOverlay, { state, player, loading: !state?.game?.reveal })
         ),
         React.createElement("div", { className: "panel controls" },
           React.createElement(GuessControl, {
-            disabled: !state?.game?.active || phase !== "guessing",
+            disabled: !state?.game?.active || phaseEffective !== "guessing",
             guessDays: tempGuessDays,
             onChange: onSliderChange,
             onCommit: onSliderCommit,
-            reveal: phase === "reveal",
+            reveal: phaseEffective === "reveal",
             state,
             player,
           }),
-          phase === "guessing" && React.createElement("div", { className: "ready-row" },
+          phaseEffective === "guessing" && React.createElement("div", { className: "ready-row" },
             React.createElement("button", { className: "ready-btn", onClick: sendReady, disabled: iAmReady }, iAmReady ? "Ready ✔" : "Ready"),
             readyInfo && React.createElement("span", { className: "ready-count" }, `${readyInfo.count}/${readyInfo.total} ready`)
           )
@@ -354,7 +366,18 @@ function App() {
   );
 }
 
-function RevealOverlay({ state, player }) {
+function RevealOverlay({ state, player, loading = false }) {
+  if (loading) {
+    return (
+      React.createElement("div", { className: "reveal-overlay" },
+        React.createElement("div", { className: "reveal-card" },
+          React.createElement("div", { className: "reveal-title" }, "Reveal!"),
+          React.createElement("div", { className: "reveal-detail" }, "Calculating results…")
+        )
+      )
+    );
+  }
+
   const trueDays = state?.game?.reveal?.true_age_days ?? null;
   const results = state?.game?.reveal?.results || {};
   const mine = player ? results[player.player_id] : null;

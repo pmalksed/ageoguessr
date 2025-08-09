@@ -85,6 +85,8 @@ class GameState:
     # Pending next round pick and duration
     pending_pick: Optional[Tuple[str, str, int]] = None
     pending_duration_seconds: int = TURN_DURATION_SECONDS_IMAGE
+    # Monotonic epoch that bumps on key state changes
+    state_epoch: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def reset(self):
@@ -106,6 +108,7 @@ class GameState:
         self.used_media.clear()
         self.pending_pick = None
         self.pending_duration_seconds = TURN_DURATION_SECONDS_IMAGE
+        self.state_epoch += 1
 
 
 STATE = GameState()
@@ -310,6 +313,7 @@ def _ensure_pending_pick_locked():
             duration = TURN_DURATION_SECONDS_VIDEO if mtype == "video" else TURN_DURATION_SECONDS_IMAGE
             STATE.pending_pick = pick
             STATE.pending_duration_seconds = duration
+            STATE.state_epoch += 1
 
 
 def _start_next_round_locked():
@@ -362,6 +366,7 @@ def _start_next_round_locked():
         )
     STATE.guesses.setdefault(STATE.current_round_index, {})
     STATE.ready[STATE.current_round_index] = set()
+    STATE.state_epoch += 1
 
 
 def _finalize_round_locked():
@@ -389,6 +394,7 @@ def _finalize_round_locked():
             if STATE.misses[pid] >= 2:
                 # kick from active players for this game
                 STATE.active_players.discard(pid)
+    STATE.state_epoch += 1
 
 
 def _finalize_round_early_if_all_ready_locked():
@@ -405,6 +411,7 @@ def _finalize_round_early_if_all_ready_locked():
         rnd.phase = "reveal"
         rnd.reveal_ends_at = _now() + timedelta(seconds=REVEAL_SECONDS)
         _ensure_pending_pick_locked()
+        STATE.state_epoch += 1
         return
 
 
@@ -420,11 +427,13 @@ def _advance_if_needed_locked():
         rnd.reveal_ends_at = _now() + timedelta(seconds=REVEAL_SECONDS)
         # Pick pending next round now so clients can prefetch
         _ensure_pending_pick_locked()
+        STATE.state_epoch += 1
         return
     # Transition reveal -> next round or end
     if rnd.phase == "reveal" and rnd.reveal_ends_at and _now() >= rnd.reveal_ends_at:
         if STATE.current_round_index >= STATE.total_rounds:
             STATE.active = False
+            STATE.state_epoch += 1
             return
         _start_next_round_locked()
         return
@@ -645,6 +654,35 @@ def get_state():
             "baby_name": BABY_NAME,
         }
         return jsonify(response)
+
+
+@app.route("/api/poll")
+def poll():
+    with STATE.lock:
+        _advance_if_needed_locked()
+        rnd = STATE.current_round
+        next_deadline = None
+        reveal_ends_ms = None
+        if rnd:
+            if rnd.phase == "guessing":
+                next_deadline = rnd.ends_at
+            elif rnd.phase == "reveal":
+                next_deadline = rnd.reveal_ends_at
+                reveal_ends_ms = int(rnd.reveal_ends_at.timestamp() * 1000) if rnd.reveal_ends_at else None
+        pending_version = None
+        if STATE.pending_pick is not None:
+            pr_filename, _pr_type, _ = STATE.pending_pick
+            pending_version = f"{STATE.game_id}-{STATE.current_round_index + 1}:{pr_filename}"
+        return jsonify({
+            "server_time_ms": int(_now().timestamp() * 1000),
+            "game_id": STATE.game_id,
+            "round_number": STATE.current_round_index,
+            "phase": rnd.phase if rnd else None,
+            "turn_ends_at_ms": int(next_deadline.timestamp() * 1000) if next_deadline else None,
+            "reveal_ends_at_ms": reveal_ends_ms,
+            "state_epoch": STATE.state_epoch,
+            "pending_version": pending_version,
+        })
 
 
 def _sanitize_username(name: str) -> str:
