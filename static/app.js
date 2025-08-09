@@ -111,8 +111,8 @@ function App() {
     const blob = await res.blob();
     const blobUrl = URL.createObjectURL(blob);
     cache.set(url, { blobUrl, type });
-    // Best-effort cache trim: keep last 4
-    if (cache.size > 4) {
+    // Best-effort cache trim: keep last 8
+    if (cache.size > 8) {
       const firstKey = cache.keys().next().value;
       const first = cache.get(firstKey);
       try { URL.revokeObjectURL(first.blobUrl); } catch {}
@@ -170,8 +170,8 @@ function App() {
       setMyScore(me.score);
     }
 
-    const round = state.game?.round_number || 0;
-    const phase = state.game?.phase || "";
+    const round = state?.game?.round_number || 0;
+    const phase = state?.game?.phase || "";
     if (phase === "reveal" && (lastRoundRef.current.round !== round || lastRoundRef.current.phase !== "reveal")) {
       lastRoundRef.current = { round, phase };
       // Compute my points from reveal block if present
@@ -198,13 +198,21 @@ function App() {
   const mediaLabel = mediaType === "image" ? "photo" : (mediaType === "video" ? "video" : "media");
   const promptText = `How old is ${babyName} in this ${mediaLabel}?`;
 
-  // Prefetch pending during reveal
+  // Prefetch pending (all available items). Do this whenever pending list changes.
   useEffect(() => {
     const pending = state?.game?.pending;
-    if (phase === "reveal" && pending?.media_url && pending?.media_type) {
+    const list = pending?.list || [];
+    if (pending?.ready === false) return;
+    if (Array.isArray(list) && list.length > 0) {
+      list.forEach((item) => {
+        if (item?.media_url && item?.media_type) {
+          prefetchToBlob(item.media_url, item.media_type).catch(() => {});
+        }
+      });
+    } else if (pending?.media_url && pending?.media_type) {
       prefetchToBlob(pending.media_url, pending.media_type).catch(() => {});
     }
-  }, [phase, state?.game?.pending?.media_url]);
+  }, [state?.game?.pending?.list?.length, state?.game?.pending?.media_url]);
 
   // Ensure current media is sourced from cache/blob
   useEffect(() => {

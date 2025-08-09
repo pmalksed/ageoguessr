@@ -38,6 +38,8 @@ app = Flask(__name__, static_folder="static", template_folder="templates")
 
 # Reveal phase duration in seconds
 REVEAL_SECONDS = 5
+# How many future media to prepare
+TARGET_PENDING = 3
 
 
 @dataclass
@@ -82,10 +84,12 @@ class GameState:
     ready: Dict[int, set[str]] = field(default_factory=dict)
     # Track used media relative paths in current game to avoid repeats
     used_media: set[str] = field(default_factory=set)
-    # Pending next round pick and duration
+    # Pending next round pick and duration (first item of queue)
     pending_pick: Optional[Tuple[str, str, int]] = None
     pending_duration_seconds: int = TURN_DURATION_SECONDS_IMAGE
-    # Whether a background task is preparing a pending pick
+    # Queue of future picks [(rel, type, age_days), ...]
+    pending_queue: List[Tuple[str, str, int]] = field(default_factory=list)
+    # Whether a background task is preparing pending picks
     pending_preparing: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -108,6 +112,7 @@ class GameState:
         self.used_media.clear()
         self.pending_pick = None
         self.pending_duration_seconds = TURN_DURATION_SECONDS_IMAGE
+        self.pending_queue = []
         self.pending_preparing = False
 
 
@@ -308,39 +313,61 @@ def _pick_random_media() -> Optional[Tuple[str, str, int]]:
 
 def _start_pending_pick_background():
     # Called under lock to ensure we do not start multiple workers
-    if STATE.pending_preparing or STATE.pending_pick is not None:
+    if STATE.pending_preparing:
         return
     STATE.pending_preparing = True
     snapshot_game_id = STATE.game_id
-    used_snapshot = set(STATE.used_media)
 
     def worker():
         try:
-            pick = _compute_random_media_candidate(used_snapshot)
-            duration = None
-            if pick is not None:
-                _rel, _type, _age = pick
-                duration = TURN_DURATION_SECONDS_VIDEO if _type == "video" else TURN_DURATION_SECONDS_IMAGE
+            while True:
+                with STATE.lock:
+                    if STATE.game_id != snapshot_game_id:
+                        STATE.pending_preparing = False
+                        return
+                    # Stop when queue filled
+                    if len(STATE.pending_queue) >= TARGET_PENDING:
+                        STATE.pending_preparing = False
+                        return
+                    # Build reserved set = used + queued + current
+                    reserved: set[str] = set(STATE.used_media)
+                    reserved.update([r for (r, _t, _a) in STATE.pending_queue])
+                    if STATE.current_round and STATE.current_round.media_filename:
+                        reserved.add(STATE.current_round.media_filename)
+                # Compute candidate outside lock
+                pick = _compute_random_media_candidate(reserved)
+                if pick is None:
+                    with STATE.lock:
+                        if STATE.game_id == snapshot_game_id:
+                            STATE.pending_preparing = False
+                        return
+                # Append under lock if still relevant and not duplicate
+                with STATE.lock:
+                    if STATE.game_id != snapshot_game_id:
+                        STATE.pending_preparing = False
+                        return
+                    rel = pick[0]
+                    if not any(rel == r for (r, _t, _a) in STATE.pending_queue):
+                        STATE.pending_queue.append(pick)
+                        # Maintain first pending_pick for backward compatibility
+                        first_rel, first_type, _first_age = STATE.pending_queue[0]
+                        STATE.pending_pick = (first_rel, first_type, _first_age)
+                        STATE.pending_duration_seconds = (
+                            TURN_DURATION_SECONDS_VIDEO if first_type == "video" else TURN_DURATION_SECONDS_IMAGE
+                        )
+                    # Loop to continue filling until TARGET_PENDING
         finally:
-            # Always clear preparing; set pick if still relevant
             with STATE.lock:
-                if STATE.game_id != snapshot_game_id:
-                    # Game changed; discard
+                if STATE.game_id == snapshot_game_id:
                     STATE.pending_preparing = False
-                    return
-                if pick is not None and STATE.pending_pick is None:
-                    STATE.pending_pick = pick
-                    STATE.pending_duration_seconds = duration or TURN_DURATION_SECONDS_IMAGE
-                # Mark not preparing; even if no pick, allow retries later
-                STATE.pending_preparing = False
 
-    t = threading.Thread(target=worker, name="pending-pick-worker", daemon=True)
+    t = threading.Thread(target=worker, name="pending-queue-worker", daemon=True)
     t.start()
 
 
-def _ensure_pending_pick_locked():
+def _ensure_pending_queue_locked():
     # Non-blocking: schedule async preparation if needed
-    if STATE.pending_pick is None and not STATE.pending_preparing:
+    if not STATE.pending_preparing and len(STATE.pending_queue) < TARGET_PENDING:
         _start_pending_pick_background()
 
 
@@ -352,11 +379,17 @@ def _start_next_round_locked():
     STATE.current_round_index += 1
     STATE.rounds_remaining = max(0, STATE.total_rounds - STATE.current_round_index)
 
-    # Use pending pick if available; otherwise pick now (synchronous) – only happens at new game start
-    if STATE.pending_pick is not None:
-        filename, media_type, age_days = STATE.pending_pick
-        duration_seconds = STATE.pending_duration_seconds
-        STATE.pending_pick = None
+    # Use pending queue if available; otherwise pick now (synchronous) – only happens at new game start
+    if STATE.pending_queue:
+        filename, media_type, age_days = STATE.pending_queue.pop(0)
+        duration_seconds = TURN_DURATION_SECONDS_VIDEO if media_type == "video" else TURN_DURATION_SECONDS_IMAGE
+        # Update the public next pending (first of queue)
+        if STATE.pending_queue:
+            next_rel, next_type, _next_age = STATE.pending_queue[0]
+            STATE.pending_pick = (next_rel, next_type, _next_age)
+            STATE.pending_duration_seconds = TURN_DURATION_SECONDS_VIDEO if next_type == "video" else TURN_DURATION_SECONDS_IMAGE
+        else:
+            STATE.pending_pick = None
     else:
         pick = _pick_random_media()
         if pick is None:
@@ -398,6 +431,8 @@ def _start_next_round_locked():
         )
     STATE.guesses.setdefault(STATE.current_round_index, {})
     STATE.ready[STATE.current_round_index] = set()
+    # Kick off background filling for subsequent rounds
+    _ensure_pending_queue_locked()
 
 
 def _finalize_round_locked():
@@ -440,7 +475,7 @@ def _finalize_round_early_if_all_ready_locked():
         _finalize_round_locked()
         rnd.phase = "reveal"
         rnd.reveal_ends_at = _now() + timedelta(seconds=REVEAL_SECONDS)
-        _ensure_pending_pick_locked()
+        _ensure_pending_queue_locked()
         return
 
 
@@ -454,14 +489,14 @@ def _advance_if_needed_locked():
         _finalize_round_locked()
         rnd.phase = "reveal"
         rnd.reveal_ends_at = _now() + timedelta(seconds=REVEAL_SECONDS)
-        # Start preparing next pick asynchronously so clients can prefetch
-        _ensure_pending_pick_locked()
+        # Start preparing next picks asynchronously so clients can prefetch
+        _ensure_pending_queue_locked()
         return
     # Transition reveal -> next round or wait for pending
     if rnd.phase == "reveal" and rnd.reveal_ends_at and _now() >= rnd.reveal_ends_at:
         # If pending not ready yet, extend reveal slightly and ensure background picker is running
-        if STATE.pending_pick is None:
-            _ensure_pending_pick_locked()
+        if len(STATE.pending_queue) == 0:
+            _ensure_pending_queue_locked()
             rnd.reveal_ends_at = _now() + timedelta(seconds=0.5)
             return
         # Pending ready – start next round
@@ -545,10 +580,41 @@ def change_username():
 
 @app.route("/api/newgame", methods=["POST"]) 
 def new_game():
+    # Synchronously prepare the first TARGET_PENDING items so early rounds never wait
     with STATE.lock:
         STATE.reset()
         STATE.active = True
+    # Build queue outside lock to avoid blocking other endpoints for long
+    while True:
+        with STATE.lock:
+            if len(STATE.pending_queue) >= TARGET_PENDING:
+                break
+            snapshot_game_id = STATE.game_id
+            # Build reserved set snapshot
+            reserved: set[str] = set(STATE.used_media)
+            reserved.update([r for (r, _t, _a) in STATE.pending_queue])
+            if STATE.current_round and STATE.current_round.media_filename:
+                reserved.add(STATE.current_round.media_filename)
+        pick = _compute_random_media_candidate(reserved)
+        if pick is None:
+            break
+        with STATE.lock:
+            if STATE.game_id != snapshot_game_id:
+                break
+            rel = pick[0]
+            if not any(rel == r for (r, _t, _a) in STATE.pending_queue):
+                STATE.pending_queue.append(pick)
+                # Maintain first pending_pick for backward compatibility
+                first_rel, first_type, _first_age = STATE.pending_queue[0]
+                STATE.pending_pick = (first_rel, first_type, _first_age)
+                STATE.pending_duration_seconds = (
+                    TURN_DURATION_SECONDS_VIDEO if first_type == "video" else TURN_DURATION_SECONDS_IMAGE
+                )
+    # Start the first round now that we have a prepared queue (or as many as possible)
+    with STATE.lock:
         _start_next_round_locked()
+        # Begin background filling of pending queue for subsequent rounds
+        _ensure_pending_queue_locked()
     return jsonify({"ok": True, "game_id": STATE.game_id})
 
 
@@ -624,22 +690,32 @@ def set_ready():
 def get_state():
     with STATE.lock:
         _advance_if_needed_locked()
+        # Keep the pending queue filling in the background
+        _ensure_pending_queue_locked()
         rnd = STATE.current_round
         if rnd and rnd.media_filename:
             version = f"{STATE.game_id}-{STATE.current_round_index}"
             media_url = f"/media/{rnd.media_filename}?v={version}"
         else:
             media_url = None
-        # Pending payload for client prefetch
+        # Pending payload for client prefetch (up to TARGET_PENDING items)
         pending_payload = None
-        if STATE.pending_pick is not None:
-            pr_filename, pr_type, _pr_age = STATE.pending_pick
-            pr_version = f"{STATE.game_id}-{STATE.current_round_index + 1}"
+        if STATE.pending_queue:
+            pending_list = []
+            for idx, (pr_filename, pr_type, _pr_age) in enumerate(STATE.pending_queue, start=1):
+                pr_version = f"{STATE.game_id}-{STATE.current_round_index + idx}"
+                pending_list.append({
+                    "media_url": f"/media/{pr_filename}?v={pr_version}",
+                    "media_type": pr_type,
+                })
+            # Backward compatible first item
+            first = pending_list[0]
             pending_payload = {
-                "media_url": f"/media/{pr_filename}?v={pr_version}",
-                "media_type": pr_type,
+                "media_url": first["media_url"],
+                "media_type": first["media_type"],
                 "turn_duration_seconds": STATE.pending_duration_seconds,
                 "ready": True,
+                "list": pending_list[:TARGET_PENDING],
             }
         elif STATE.pending_preparing:
             pending_payload = {
