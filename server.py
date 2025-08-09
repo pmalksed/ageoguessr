@@ -85,8 +85,8 @@ class GameState:
     # Pending next round pick and duration
     pending_pick: Optional[Tuple[str, str, int]] = None
     pending_duration_seconds: int = TURN_DURATION_SECONDS_IMAGE
-    # Monotonic epoch that bumps on key state changes
-    state_epoch: int = 0
+    # Whether a background task is preparing a pending pick
+    pending_preparing: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def reset(self):
@@ -108,7 +108,7 @@ class GameState:
         self.used_media.clear()
         self.pending_pick = None
         self.pending_duration_seconds = TURN_DURATION_SECONDS_IMAGE
-        self.state_epoch += 1
+        self.pending_preparing = False
 
 
 STATE = GameState()
@@ -276,11 +276,12 @@ def _age_in_days_for_media_with_fallback(path: Path) -> Optional[int]:
     return max(0, int(delta.total_seconds() // 86400))
 
 
-def _pick_random_media() -> Optional[Tuple[str, str, int]]:
+# Compute a random eligible media candidate WITHOUT mutating global state
+# Returns (rel_path, media_type, age_days) or None
+def _compute_random_media_candidate(used_rel_paths: set[str]) -> Optional[Tuple[str, str, int]]:
     files = _list_media_files()
     if not files:
         return None
-    # Filter to only those with a determinable age
     eligible: List[Tuple[Path, str, int]] = []
     for f in files:
         media_type = _media_type_for(f)
@@ -289,31 +290,58 @@ def _pick_random_media() -> Optional[Tuple[str, str, int]]:
             eligible.append((f, media_type, age_days))
     if not eligible:
         return None
-    # Avoid repeats if possible within the game
-    used = STATE.used_media
-    # Build list of relative paths
+
     def rel_str(p: Path) -> str:
         return str(p.relative_to(MEDIA_DIR)).replace(os.sep, "/")
 
-    not_used = [(p, t, a) for (p, t, a) in eligible if rel_str(p) not in used]
+    not_used = [(p, t, a) for (p, t, a) in eligible if rel_str(p) not in used_rel_paths]
     candidates = not_used if not_used else eligible
-    chosen = random.choice(candidates)
-    path, media_type, age_days = chosen
+    path, media_type, age_days = random.choice(candidates)
     rel = rel_str(path)
-    # Track as used for this game
-    STATE.used_media.add(rel)
     return (rel, media_type, age_days)
 
 
+def _pick_random_media() -> Optional[Tuple[str, str, int]]:
+    # Wrapper to preserve legacy call sites; does not mutate used list
+    return _compute_random_media_candidate(STATE.used_media)
+
+
+def _start_pending_pick_background():
+    # Called under lock to ensure we do not start multiple workers
+    if STATE.pending_preparing or STATE.pending_pick is not None:
+        return
+    STATE.pending_preparing = True
+    snapshot_game_id = STATE.game_id
+    used_snapshot = set(STATE.used_media)
+
+    def worker():
+        try:
+            pick = _compute_random_media_candidate(used_snapshot)
+            duration = None
+            if pick is not None:
+                _rel, _type, _age = pick
+                duration = TURN_DURATION_SECONDS_VIDEO if _type == "video" else TURN_DURATION_SECONDS_IMAGE
+        finally:
+            # Always clear preparing; set pick if still relevant
+            with STATE.lock:
+                if STATE.game_id != snapshot_game_id:
+                    # Game changed; discard
+                    STATE.pending_preparing = False
+                    return
+                if pick is not None and STATE.pending_pick is None:
+                    STATE.pending_pick = pick
+                    STATE.pending_duration_seconds = duration or TURN_DURATION_SECONDS_IMAGE
+                # Mark not preparing; even if no pick, allow retries later
+                STATE.pending_preparing = False
+
+    t = threading.Thread(target=worker, name="pending-pick-worker", daemon=True)
+    t.start()
+
+
 def _ensure_pending_pick_locked():
-    if STATE.pending_pick is None:
-        pick = _pick_random_media()
-        if pick is not None:
-            rel, mtype, _age = pick
-            duration = TURN_DURATION_SECONDS_VIDEO if mtype == "video" else TURN_DURATION_SECONDS_IMAGE
-            STATE.pending_pick = pick
-            STATE.pending_duration_seconds = duration
-            STATE.state_epoch += 1
+    # Non-blocking: schedule async preparation if needed
+    if STATE.pending_pick is None and not STATE.pending_preparing:
+        _start_pending_pick_background()
 
 
 def _start_next_round_locked():
@@ -324,7 +352,7 @@ def _start_next_round_locked():
     STATE.current_round_index += 1
     STATE.rounds_remaining = max(0, STATE.total_rounds - STATE.current_round_index)
 
-    # Use pending pick if available; otherwise pick now
+    # Use pending pick if available; otherwise pick now (synchronous) – only happens at new game start
     if STATE.pending_pick is not None:
         filename, media_type, age_days = STATE.pending_pick
         duration_seconds = STATE.pending_duration_seconds
@@ -339,6 +367,10 @@ def _start_next_round_locked():
         else:
             filename, media_type, age_days = pick
             duration_seconds = TURN_DURATION_SECONDS_VIDEO if media_type == "video" else TURN_DURATION_SECONDS_IMAGE
+
+    # If we have a filename, mark it as used now (commit)
+    if filename:
+        STATE.used_media.add(filename)
 
     STATE.current_turn_duration_seconds = duration_seconds
     guess_ends_at = _now() + timedelta(seconds=duration_seconds)
@@ -366,7 +398,6 @@ def _start_next_round_locked():
         )
     STATE.guesses.setdefault(STATE.current_round_index, {})
     STATE.ready[STATE.current_round_index] = set()
-    STATE.state_epoch += 1
 
 
 def _finalize_round_locked():
@@ -394,7 +425,6 @@ def _finalize_round_locked():
             if STATE.misses[pid] >= 2:
                 # kick from active players for this game
                 STATE.active_players.discard(pid)
-    STATE.state_epoch += 1
 
 
 def _finalize_round_early_if_all_ready_locked():
@@ -411,7 +441,6 @@ def _finalize_round_early_if_all_ready_locked():
         rnd.phase = "reveal"
         rnd.reveal_ends_at = _now() + timedelta(seconds=REVEAL_SECONDS)
         _ensure_pending_pick_locked()
-        STATE.state_epoch += 1
         return
 
 
@@ -425,15 +454,19 @@ def _advance_if_needed_locked():
         _finalize_round_locked()
         rnd.phase = "reveal"
         rnd.reveal_ends_at = _now() + timedelta(seconds=REVEAL_SECONDS)
-        # Pick pending next round now so clients can prefetch
+        # Start preparing next pick asynchronously so clients can prefetch
         _ensure_pending_pick_locked()
-        STATE.state_epoch += 1
         return
-    # Transition reveal -> next round or end
+    # Transition reveal -> next round or wait for pending
     if rnd.phase == "reveal" and rnd.reveal_ends_at and _now() >= rnd.reveal_ends_at:
+        # If pending not ready yet, extend reveal slightly and ensure background picker is running
+        if STATE.pending_pick is None:
+            _ensure_pending_pick_locked()
+            rnd.reveal_ends_at = _now() + timedelta(seconds=0.5)
+            return
+        # Pending ready – start next round
         if STATE.current_round_index >= STATE.total_rounds:
             STATE.active = False
-            STATE.state_epoch += 1
             return
         _start_next_round_locked()
         return
@@ -606,6 +639,11 @@ def get_state():
                 "media_url": f"/media/{pr_filename}?v={pr_version}",
                 "media_type": pr_type,
                 "turn_duration_seconds": STATE.pending_duration_seconds,
+                "ready": True,
+            }
+        elif STATE.pending_preparing:
+            pending_payload = {
+                "ready": False,
             }
         # compute next deadline for countdown depending on phase
         next_deadline = None
@@ -654,35 +692,6 @@ def get_state():
             "baby_name": BABY_NAME,
         }
         return jsonify(response)
-
-
-@app.route("/api/poll")
-def poll():
-    with STATE.lock:
-        _advance_if_needed_locked()
-        rnd = STATE.current_round
-        next_deadline = None
-        reveal_ends_ms = None
-        if rnd:
-            if rnd.phase == "guessing":
-                next_deadline = rnd.ends_at
-            elif rnd.phase == "reveal":
-                next_deadline = rnd.reveal_ends_at
-                reveal_ends_ms = int(rnd.reveal_ends_at.timestamp() * 1000) if rnd.reveal_ends_at else None
-        pending_version = None
-        if STATE.pending_pick is not None:
-            pr_filename, _pr_type, _ = STATE.pending_pick
-            pending_version = f"{STATE.game_id}-{STATE.current_round_index + 1}:{pr_filename}"
-        return jsonify({
-            "server_time_ms": int(_now().timestamp() * 1000),
-            "game_id": STATE.game_id,
-            "round_number": STATE.current_round_index,
-            "phase": rnd.phase if rnd else None,
-            "turn_ends_at_ms": int(next_deadline.timestamp() * 1000) if next_deadline else None,
-            "reveal_ends_at_ms": reveal_ends_ms,
-            "state_epoch": STATE.state_epoch,
-            "pending_version": pending_version,
-        })
 
 
 def _sanitize_username(name: str) -> str:
