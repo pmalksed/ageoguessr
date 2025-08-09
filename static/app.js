@@ -96,23 +96,50 @@ function App() {
   // Track last seen round/phase to trigger animations
   const lastRoundRef = useRef({ round: 0, phase: "" });
 
-  // Poll server state every second
-  useEffect(() => {
-    let active = true;
-    async function tick() {
-      try {
-        const data = await api("/api/state");
-        if (!active) return;
-        setState(data);
-        setNowMs(data.server_time_ms);
-      } catch (e) {
-        // ignore transient failures
-      }
+  // Media cache: versioned URL -> { blobUrl, type }
+  const mediaCacheRef = useRef(new Map());
+  const [currentMediaSrc, setCurrentMediaSrc] = useState(null);
+  const [currentMediaType, setCurrentMediaType] = useState(null);
+  const currentUrlRef = useRef(null);
+
+  async function prefetchToBlob(url, type) {
+    if (!url) return null;
+    const cache = mediaCacheRef.current;
+    if (cache.has(url)) return cache.get(url).blobUrl;
+    const res = await fetch(url, { cache: "force-cache" });
+    if (!res.ok) throw new Error("media fetch failed");
+    const blob = await res.blob();
+    const blobUrl = URL.createObjectURL(blob);
+    cache.set(url, { blobUrl, type });
+    // Best-effort cache trim: keep last 4
+    if (cache.size > 4) {
+      const firstKey = cache.keys().next().value;
+      const first = cache.get(firstKey);
+      try { URL.revokeObjectURL(first.blobUrl); } catch {}
+      cache.delete(firstKey);
     }
-    tick();
-    const h = setInterval(tick, 1000);
-    return () => { active = false; clearInterval(h); };
-  }, []);
+    return blobUrl;
+  }
+
+  function usePoll() {
+    useEffect(() => {
+      let active = true;
+      async function tick() {
+        try {
+          const data = await api("/api/state");
+          if (!active) return;
+          setState(data);
+          setNowMs(data.server_time_ms);
+        } catch (e) {
+          // ignore
+        }
+      }
+      tick();
+      const h = setInterval(tick, 1000);
+      return () => { active = false; clearInterval(h); };
+    }, []);
+  }
+  usePoll();
 
   // Auto-join the current game when we have a player
   useEffect(() => {
@@ -152,7 +179,6 @@ function App() {
       const mine = results[player.player_id];
       if (mine && mine.points > 0) {
         setBump({ points: mine.points });
-        // Hide bump after animation
         setTimeout(() => setBump(null), 900);
       } else {
         setBump(null);
@@ -165,23 +191,64 @@ function App() {
   const endsAt = state?.game?.turn_ends_at_ms ?? null;
   const totalDurationMs = (state?.game?.turn_duration_seconds || 0) * 1000;
 
-  const mediaUrl = state?.game?.media_url ?? null;
+  const serverMediaUrl = state?.game?.media_url ?? null;
   const mediaType = state?.game?.media_type ?? null;
   const phase = state?.game?.phase ?? "";
   const babyName = state?.baby_name || "the baby";
   const mediaLabel = mediaType === "image" ? "photo" : (mediaType === "video" ? "video" : "media");
   const promptText = `How old is ${babyName} in this ${mediaLabel}?`;
 
+  // Prefetch pending during reveal
+  useEffect(() => {
+    const pending = state?.game?.pending;
+    if (phase === "reveal" && pending?.media_url && pending?.media_type) {
+      prefetchToBlob(pending.media_url, pending.media_type).catch(() => {});
+    }
+  }, [phase, state?.game?.pending?.media_url]);
+
+  // Ensure current media is sourced from cache/blob
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (!serverMediaUrl || !mediaType) {
+        setCurrentMediaSrc(null);
+        setCurrentMediaType(null);
+        currentUrlRef.current = null;
+        return;
+      }
+      if (currentUrlRef.current === serverMediaUrl && currentMediaSrc) return;
+      currentUrlRef.current = serverMediaUrl;
+      // Prefer cached blob (possibly preloaded as pending)
+      const cache = mediaCacheRef.current;
+      if (cache.has(serverMediaUrl)) {
+        const { blobUrl } = cache.get(serverMediaUrl);
+        if (!cancelled) {
+          setCurrentMediaSrc(blobUrl);
+          setCurrentMediaType(mediaType);
+        }
+        return;
+      }
+      // Not cached yet: fetch now and then display
+      try {
+        const blobUrl = await prefetchToBlob(serverMediaUrl, mediaType);
+        if (!cancelled) {
+          setCurrentMediaSrc(blobUrl);
+          setCurrentMediaType(mediaType);
+        }
+      } catch (e) {
+        // leave as null
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [serverMediaUrl, mediaType]);
+
   async function sendGuess(days) {
     if (!player?.player_id) return;
-    // Only send distinct values to save spam
     if (lastSentGuessRef.current === days) return;
     lastSentGuessRef.current = days;
     try {
       await api("/api/guess", { method: "POST", body: JSON.stringify({ player_id: player.player_id, guess_days: days }) });
-    } catch (e) {
-      // ignore
-    }
+    } catch (e) {}
   }
 
   // Hidden newgame trigger by typing 'newgame'
@@ -211,11 +278,9 @@ function App() {
   const onSliderChange = (e) => {
     const val = parseInt(e.target.value, 10);
     setTempGuessDays(val);
-    // Immediately send on change so single-clicks work reliably
     sendGuess(val);
   };
   const onSliderCommit = () => {
-    // Keep as fallback (won't spam due to lastSentGuessRef)
     if (tempGuessDays != null) sendGuess(tempGuessDays);
   };
 
@@ -243,12 +308,12 @@ function App() {
         ),
         React.createElement("div", { className: "panel media-stage" },
           React.createElement("div", { className: "media-box" },
-            state?.game?.active && mediaUrl ? (
-              mediaType === "video"
-                ? React.createElement("video", { src: mediaUrl, controls: true, autoPlay: true, loop: true })
-                : React.createElement("img", { src: mediaUrl, alt: "current" })
+            state?.game?.active && currentMediaSrc ? (
+              currentMediaType === "video"
+                ? React.createElement("video", { src: currentMediaSrc, controls: true, autoPlay: true, loop: true })
+                : React.createElement("img", { src: currentMediaSrc, alt: "current" })
             ) : (
-              null
+              state?.game?.active ? React.createElement("div", null, "Loading media...") : null
             )
           ),
           phase === "reveal" && React.createElement(RevealOverlay, { state, player })

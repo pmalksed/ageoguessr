@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, Tuple
 import re
 import subprocess
 
-from flask import Flask, jsonify, request, send_from_directory, render_template
+from flask import Flask, jsonify, request, send_from_directory, render_template, make_response
 
 from config import (
     BIRTH_DATE,
@@ -82,6 +82,9 @@ class GameState:
     ready: Dict[int, set[str]] = field(default_factory=dict)
     # Track used media relative paths in current game to avoid repeats
     used_media: set[str] = field(default_factory=set)
+    # Pending next round pick and duration
+    pending_pick: Optional[Tuple[str, str, int]] = None
+    pending_duration_seconds: int = TURN_DURATION_SECONDS_IMAGE
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def reset(self):
@@ -101,6 +104,8 @@ class GameState:
         self.results = {}
         self.ready = {}
         self.used_media.clear()
+        self.pending_pick = None
+        self.pending_duration_seconds = TURN_DURATION_SECONDS_IMAGE
 
 
 STATE = GameState()
@@ -297,19 +302,45 @@ def _pick_random_media() -> Optional[Tuple[str, str, int]]:
     return (rel, media_type, age_days)
 
 
+def _ensure_pending_pick_locked():
+    if STATE.pending_pick is None:
+        pick = _pick_random_media()
+        if pick is not None:
+            rel, mtype, _age = pick
+            duration = TURN_DURATION_SECONDS_VIDEO if mtype == "video" else TURN_DURATION_SECONDS_IMAGE
+            STATE.pending_pick = pick
+            STATE.pending_duration_seconds = duration
+
+
 def _start_next_round_locked():
     global STATE
-    pick = _pick_random_media()
     # Determine duration based on media type once we know it
     duration_seconds = TURN_DURATION_SECONDS_IMAGE
 
     STATE.current_round_index += 1
     STATE.rounds_remaining = max(0, STATE.total_rounds - STATE.current_round_index)
 
-    if pick is None:
+    # Use pending pick if available; otherwise pick now
+    if STATE.pending_pick is not None:
+        filename, media_type, age_days = STATE.pending_pick
+        duration_seconds = STATE.pending_duration_seconds
+        STATE.pending_pick = None
+    else:
+        pick = _pick_random_media()
+        if pick is None:
+            filename = None
+            media_type = None
+            age_days = None
+            duration_seconds = TURN_DURATION_SECONDS_IMAGE
+        else:
+            filename, media_type, age_days = pick
+            duration_seconds = TURN_DURATION_SECONDS_VIDEO if media_type == "video" else TURN_DURATION_SECONDS_IMAGE
+
+    STATE.current_turn_duration_seconds = duration_seconds
+    guess_ends_at = _now() + timedelta(seconds=duration_seconds)
+
+    if filename is None:
         # No media, still advance the timer so clients can see countdown; media fields None
-        STATE.current_turn_duration_seconds = duration_seconds
-        guess_ends_at = _now() + timedelta(seconds=duration_seconds)
         STATE.current_round = RoundInfo(
             round_index=STATE.current_round_index,
             media_filename=None,
@@ -320,10 +351,6 @@ def _start_next_round_locked():
             phase="guessing",
         )
     else:
-        filename, media_type, age_days = pick
-        duration_seconds = TURN_DURATION_SECONDS_VIDEO if media_type == "video" else TURN_DURATION_SECONDS_IMAGE
-        STATE.current_turn_duration_seconds = duration_seconds
-        guess_ends_at = _now() + timedelta(seconds=duration_seconds)
         STATE.current_round = RoundInfo(
             round_index=STATE.current_round_index,
             media_filename=filename,
@@ -377,6 +404,7 @@ def _finalize_round_early_if_all_ready_locked():
         _finalize_round_locked()
         rnd.phase = "reveal"
         rnd.reveal_ends_at = _now() + timedelta(seconds=REVEAL_SECONDS)
+        _ensure_pending_pick_locked()
         return
 
 
@@ -390,6 +418,8 @@ def _advance_if_needed_locked():
         _finalize_round_locked()
         rnd.phase = "reveal"
         rnd.reveal_ends_at = _now() + timedelta(seconds=REVEAL_SECONDS)
+        # Pick pending next round now so clients can prefetch
+        _ensure_pending_pick_locked()
         return
     # Transition reveal -> next round or end
     if rnd.phase == "reveal" and rnd.reveal_ends_at and _now() >= rnd.reveal_ends_at:
@@ -425,7 +455,10 @@ def media(filename: str):
         return ("Not found", 404)
     directory = os.path.dirname(full_path)
     basename = os.path.basename(full_path)
-    return send_from_directory(directory, basename)
+    resp = make_response(send_from_directory(directory, basename))
+    # Strong caching: versioned URLs via query param make each round unique
+    resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    return resp
 
 
 @app.route("/api/register", methods=["POST"]) 
@@ -520,7 +553,6 @@ def join_game():
         # mark as active for the current game
         STATE.active_players.add(player_id)
         STATE.misses[player_id] = 0
-        # also add to current ready set? no, ready is explicit via /api/ready
     return jsonify({"ok": True})
 
 
@@ -556,6 +588,16 @@ def get_state():
             media_url = f"/media/{rnd.media_filename}?v={version}"
         else:
             media_url = None
+        # Pending payload for client prefetch
+        pending_payload = None
+        if STATE.pending_pick is not None:
+            pr_filename, pr_type, _pr_age = STATE.pending_pick
+            pr_version = f"{STATE.game_id}-{STATE.current_round_index + 1}"
+            pending_payload = {
+                "media_url": f"/media/{pr_filename}?v={pr_version}",
+                "media_type": pr_type,
+                "turn_duration_seconds": STATE.pending_duration_seconds,
+            }
         # compute next deadline for countdown depending on phase
         next_deadline = None
         if rnd:
@@ -571,7 +613,7 @@ def get_state():
                 "results": STATE.results.get(rnd.round_index, {}),
                 "reveal_ends_at_ms": int(rnd.reveal_ends_at.timestamp() * 1000) if rnd.reveal_ends_at else None,
             }
-        # readiness info (counts based on active players this game)
+        # readiness info
         ready_payload = None
         if rnd and rnd.phase == "guessing":
             active_set = set(STATE.active_players)
@@ -597,6 +639,7 @@ def get_state():
                 "phase": rnd.phase if rnd else None,
                 "reveal": reveal_payload,
                 "ready": ready_payload,
+                "pending": pending_payload,
             },
             "leaderboard": _public_leaderboard(),
             "baby_name": BABY_NAME,
