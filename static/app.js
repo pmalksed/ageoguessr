@@ -8,9 +8,12 @@ function msToClock(ms) {
   return `${mm}:${ss}`;
 }
 
-function daysToMonthsDays(days) {
+// Server sends the real range in /api/state; this is just the pre-load default.
+const DEFAULT_RANGE = { maxDays: 730, maxMonths: 24 };
+
+function daysToMonthsDays(days, range = DEFAULT_RANGE) {
   // Align ticks to average month length so marks and labels match better
-  const avgMonth = 365 / 12; // ≈30.4167
+  const avgMonth = range.maxDays / range.maxMonths; // ≈30.4167
   const monthsFloat = days / avgMonth;
   let months = Math.floor(monthsFloat + 1e-9);
   let remainder = days - months * avgMonth;
@@ -20,8 +23,7 @@ function daysToMonthsDays(days) {
     months += 1;
     remDays = 0;
   }
-  // Clamp to 0..12 months
-  if (months > 12) { months = 12; remDays = 0; }
+  if (months > range.maxMonths) { months = range.maxMonths; remDays = 0; }
   if (months < 0) { months = 0; }
   return { months, days: remDays };
 }
@@ -195,6 +197,10 @@ function App() {
   const mediaType = state?.game?.media_type ?? null;
   const phase = state?.game?.phase ?? "";
   const babyName = state?.baby_name || "the baby";
+  const range = useMemo(() => ({
+    maxDays: state?.max_age_days || DEFAULT_RANGE.maxDays,
+    maxMonths: state?.max_age_months || DEFAULT_RANGE.maxMonths,
+  }), [state?.max_age_days, state?.max_age_months]);
   const mediaLabel = mediaType === "image" ? "photo" : (mediaType === "video" ? "video" : "media");
   const promptText = `How old is ${babyName} in this ${mediaLabel}?`;
 
@@ -324,7 +330,7 @@ function App() {
               state?.game?.active ? React.createElement("div", null, "Loading media...") : null
             )
           ),
-          phase === "reveal" && React.createElement(RevealOverlay, { state, player })
+          phase === "reveal" && React.createElement(RevealOverlay, { state, player, range })
         ),
         React.createElement("div", { className: "panel controls" },
           React.createElement(GuessControl, {
@@ -335,6 +341,7 @@ function App() {
             reveal: phase === "reveal",
             state,
             player,
+            range,
           }),
           phase === "guessing" && React.createElement("div", { className: "ready-row" },
             React.createElement("button", { className: "ready-btn", onClick: sendReady, disabled: iAmReady }, iAmReady ? "Ready ✔" : "Ready"),
@@ -362,7 +369,7 @@ function App() {
   );
 }
 
-function RevealOverlay({ state, player }) {
+function RevealOverlay({ state, player, range = DEFAULT_RANGE }) {
   const trueDays = state?.game?.reveal?.true_age_days ?? null;
   const results = state?.game?.reveal?.results || {};
   const mine = player ? results[player.player_id] : null;
@@ -375,8 +382,8 @@ function RevealOverlay({ state, player }) {
   entries.sort((a, b) => a.diff - b.diff);
   const top5 = entries.slice(0, 5);
 
-  const { months: tm, days: td } = daysToMonthsDays(trueDays ?? 0);
-  const { months: gm, days: gd } = daysToMonthsDays(myGuess ?? 0);
+  const { months: tm, days: td } = daysToMonthsDays(trueDays ?? 0, range);
+  const { months: gm, days: gd } = daysToMonthsDays(myGuess ?? 0, range);
 
   return (
     React.createElement("div", { className: "reveal-overlay" },
@@ -389,7 +396,7 @@ function RevealOverlay({ state, player }) {
         top5.length > 0 && React.createElement(React.Fragment, null,
           React.createElement("div", { className: "reveal-title", style: { marginTop: 8 } }, "Top guesses"),
           top5.map((e) => {
-            const dd = daysToMonthsDays(e.guess_days || 0);
+            const dd = daysToMonthsDays(e.guess_days || 0, range);
             return React.createElement("div", { key: e.player_id, className: "reveal-detail" }, `${e.username}: ${dd.months} months, ${dd.days} days (${e.guess_days} days) — off by ${e.diff}`);
           })
         )
@@ -413,10 +420,12 @@ function UsernameEditor({ player, onSubmit }) {
   );
 }
 
-function GuessControl({ disabled, guessDays, onChange, onCommit, reveal = false, state, player }) {
-  const display = useMemo(() => daysToMonthsDays(guessDays ?? 0), [guessDays]);
+function GuessControl({ disabled, guessDays, onChange, onCommit, reveal = false, state, player, range = DEFAULT_RANGE }) {
+  const display = useMemo(() => daysToMonthsDays(guessDays ?? 0, range), [guessDays, range]);
   const label = `${display.months} months, ${display.days} days`;
-  const marks = Array.from({ length: 13 }, (_, i) => i);
+  // Keep roughly a dozen labels however wide the range is (every 2nd month at 24)
+  const tickStep = Math.max(1, Math.ceil(range.maxMonths / 12));
+  const marks = Array.from({ length: Math.floor(range.maxMonths / tickStep) + 1 }, (_, i) => i * tickStep);
   const hasGuess = guessDays != null;
 
   // Build dots for reveal
@@ -439,12 +448,12 @@ function GuessControl({ disabled, guessDays, onChange, onCommit, reveal = false,
   return (
     React.createElement("div", { className: "range-wrap" },
       React.createElement("div", { className: `range-overlay ${reveal ? "show" : ""}` },
-        dots.map((d) => React.createElement("span", { key: d.key, className: "dot", style: { left: `${(d.value / 365) * 100}%`, background: d.color, width: d.size, height: d.size } }))
+        dots.map((d) => React.createElement("span", { key: d.key, className: "dot", style: { left: `${(d.value / range.maxDays) * 100}%`, background: d.color, width: d.size, height: d.size } }))
       ),
       React.createElement("input", {
         type: "range",
         min: 0,
-        max: 365,
+        max: range.maxDays,
         step: 1,
         value: hasGuess ? guessDays : 0,
         className: hasGuess ? "has-guess" : "",

@@ -1,21 +1,31 @@
 from __future__ import annotations
 
+import json
 import os
 import random
 import threading
+import time
 import uuid
+from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 import re
 import subprocess
 
 from flask import Flask, jsonify, request, send_from_directory, render_template, make_response
 
 from config import (
+    AGE_GRACE_DAYS,
     BIRTH_DATE,
+    DAYS_PER_MONTH,
+    MAX_AGE_DAYS,
+    MAX_AGE_MONTHS,
     MEDIA_DIR,
+    MEDIA_INDEX_PATH,
+    MEDIA_PROBE_WORKERS,
     TURN_DURATION_SECONDS_IMAGE,
     TURN_DURATION_SECONDS_VIDEO,
     TOTAL_ROUNDS,
@@ -270,7 +280,11 @@ def _age_in_days_for_media_good_only(path: Path) -> Optional[int]:
 
 
 def _age_in_days_for_media_with_fallback(path: Path) -> Optional[int]:
-    """Try good capture-time methods first; fall back to parsing filename date if needed."""
+    """Try good capture-time methods first; fall back to parsing filename date if needed.
+
+    May be negative for anything shot before the birth date; the media index
+    decides what is close enough to count.
+    """
     dt = _capture_datetime_via_good_methods(path)
     if not dt:
         # Fallback to filename-based parsing
@@ -278,32 +292,213 @@ def _age_in_days_for_media_with_fallback(path: Path) -> Optional[int]:
     if not dt:
         return None
     delta = dt - BIRTH_DATE
-    return max(0, int(delta.total_seconds() // 86400))
+    return int(delta.total_seconds() // 86400)
+
+
+# ---------------------------------------------------------------------------
+# Media index
+#
+# Dating a file means reading EXIF or shelling out to ffprobe, which is far too
+# slow to redo on every pick. We keep an in-memory index of every usable file
+# and back it with a small on-disk cache keyed by (mtime, size) so a restart
+# only re-probes files that actually changed.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MediaEntry:
+    rel: str
+    media_type: str
+    age_days: int
+    month: int  # which month-of-life bucket this falls into, 0-based
+
+
+# How long the index is trusted before we re-stat the media directory
+MEDIA_INDEX_TTL_SECONDS = 30.0
+
+_index_lock = threading.Lock()  # guards the probe cache and the built index
+_index_build_lock = threading.Lock()  # serializes (slow) rebuilds
+# rel path -> (mtime, size, age_days or None if the file could not be dated)
+_probe_cache: Dict[str, Tuple[float, int, Optional[int]]] = {}
+_probe_cache_loaded = False
+_index_entries: List[MediaEntry] = []
+_index_scanned_at: float = 0.0
+_index_skipped: Dict[str, List[str]] = {"undatable": [], "out_of_range": []}
+
+
+def _rel_str(p: Path) -> str:
+    return str(p.relative_to(MEDIA_DIR)).replace(os.sep, "/")
+
+
+def _month_of_life(age_days: int) -> int:
+    return max(0, min(MAX_AGE_MONTHS - 1, int(age_days // DAYS_PER_MONTH)))
+
+
+def _load_probe_cache_locked() -> None:
+    global _probe_cache_loaded
+    if _probe_cache_loaded:
+        return
+    _probe_cache_loaded = True
+    try:
+        with open(MEDIA_INDEX_PATH, "r") as f:
+            raw = json.load(f)
+    except Exception:
+        return
+    # Ages are relative to the birth date, so a changed birth date voids the cache
+    if not isinstance(raw, dict) or raw.get("birth_date") != BIRTH_DATE.isoformat():
+        return
+    for rel, rec in (raw.get("files") or {}).items():
+        try:
+            age = rec.get("age_days")
+            _probe_cache[rel] = (float(rec["mtime"]), int(rec["size"]), None if age is None else int(age))
+        except Exception:
+            continue
+
+
+def _save_probe_cache_locked() -> None:
+    payload = {
+        "birth_date": BIRTH_DATE.isoformat(),
+        "files": {
+            rel: {"mtime": mtime, "size": size, "age_days": age}
+            for rel, (mtime, size, age) in _probe_cache.items()
+        },
+    }
+    tmp_path = f"{MEDIA_INDEX_PATH}.tmp"
+    try:
+        with open(tmp_path, "w") as f:
+            json.dump(payload, f)
+        os.replace(tmp_path, MEDIA_INDEX_PATH)
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+def _media_index(force: bool = False) -> List[MediaEntry]:
+    """Every datable file inside the game's age range, cached and refreshed lazily."""
+    with _index_lock:
+        fresh = _index_scanned_at and (time.monotonic() - _index_scanned_at) < MEDIA_INDEX_TTL_SECONDS
+        if fresh and not force:
+            return _index_entries
+
+    with _index_build_lock:
+        with _index_lock:
+            fresh = _index_scanned_at and (time.monotonic() - _index_scanned_at) < MEDIA_INDEX_TTL_SECONDS
+            if fresh and not force:
+                return _index_entries
+            _load_probe_cache_locked()
+            known = dict(_probe_cache)
+
+        # Stat everything, then probe only what the cache doesn't already cover
+        found: List[Tuple[str, Path, float, int]] = []
+        for path in _list_media_files():
+            try:
+                st = path.stat()
+            except OSError:
+                continue
+            found.append((_rel_str(path), path, st.st_mtime, st.st_size))
+
+        stale = [
+            (rel, path, mtime, size)
+            for (rel, path, mtime, size) in found
+            if rel not in known or known[rel][0] != mtime or known[rel][1] != size
+        ]
+        probed: Dict[str, Tuple[float, int, Optional[int]]] = {}
+        if stale:
+            workers = max(1, min(MEDIA_PROBE_WORKERS, len(stale)))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                ages = pool.map(_age_in_days_for_media_with_fallback, [path for (_r, path, _m, _s) in stale])
+                for (rel, _path, mtime, size), age in zip(stale, ages):
+                    probed[rel] = (mtime, size, age)
+
+        with _index_lock:
+            _probe_cache.update(probed)
+            live = {rel for (rel, _p, _m, _s) in found}
+            dropped = [rel for rel in _probe_cache if rel not in live]
+            for rel in dropped:
+                del _probe_cache[rel]
+
+            entries: List[MediaEntry] = []
+            skipped: Dict[str, List[str]] = {"undatable": [], "out_of_range": []}
+            for rel, path, _mtime, _size in found:
+                age = _probe_cache.get(rel, (0.0, 0, None))[2]
+                if age is None:
+                    skipped["undatable"].append(rel)
+                    continue
+                # A little slop at either end absorbs timezone edges and party-day
+                # shots; anything further out isn't a picture of this age range.
+                if not (-AGE_GRACE_DAYS <= age <= MAX_AGE_DAYS + AGE_GRACE_DAYS):
+                    skipped["out_of_range"].append(rel)
+                    continue
+                age = min(max(age, 0), MAX_AGE_DAYS)
+                entries.append(MediaEntry(rel, _media_type_for(path), age, _month_of_life(age)))
+
+            _set_index_locked(entries, skipped)
+            if probed or dropped:
+                _save_probe_cache_locked()
+            return _index_entries
+
+
+def _set_index_locked(entries: List[MediaEntry], skipped: Dict[str, List[str]]) -> None:
+    global _index_entries, _index_scanned_at, _index_skipped
+    _index_entries = entries
+    _index_skipped = skipped
+    _index_scanned_at = time.monotonic()
+
+
+def _month_targets(months_with_media: Iterable[int]) -> Dict[int, float]:
+    """How much of the game each month-of-life should get.
+
+    Every month in [0, MAX_AGE_MONTHS) asks for an equal slice. Months we have
+    no media for can't be served, so they hand their slice to the nearest
+    month(s) that do have some - a gap at month 7 nudges months 6 and 8 up
+    rather than quietly biasing the game toward whichever month we shot most.
+    """
+    available = sorted(set(months_with_media))
+    if not available:
+        return {}
+    targets = {month: 0.0 for month in available}
+    slice_size = 1.0 / MAX_AGE_MONTHS
+    for month in range(MAX_AGE_MONTHS):
+        closest = min(abs(month - other) for other in available)
+        nearest = [other for other in available if abs(month - other) == closest]
+        for other in nearest:
+            targets[other] += slice_size / len(nearest)
+    return targets
 
 
 # Compute a random eligible media candidate WITHOUT mutating global state
 # Returns (rel_path, media_type, age_days) or None
 def _compute_random_media_candidate(used_rel_paths: set[str]) -> Optional[Tuple[str, str, int]]:
-    files = _list_media_files()
-    if not files:
-        return None
-    eligible: List[Tuple[Path, str, int]] = []
-    for f in files:
-        media_type = _media_type_for(f)
-        age_days = _age_in_days_for_media_with_fallback(f)
-        if age_days is not None and media_type in ("image", "video"):
-            eligible.append((f, media_type, age_days))
-    if not eligible:
+    entries = _media_index()
+    if not entries:
         return None
 
-    def rel_str(p: Path) -> str:
-        return str(p.relative_to(MEDIA_DIR)).replace(os.sep, "/")
+    available = [e for e in entries if e.rel not in used_rel_paths]
+    if not available:
+        # Every file has been shown; start allowing repeats rather than stalling
+        available = entries
 
-    not_used = [(p, t, a) for (p, t, a) in eligible if rel_str(p) not in used_rel_paths]
-    candidates = not_used if not_used else eligible
-    path, media_type, age_days = random.choice(candidates)
-    rel = rel_str(path)
-    return (rel, media_type, age_days)
+    by_month: Dict[int, List[MediaEntry]] = defaultdict(list)
+    for entry in available:
+        by_month[entry.month].append(entry)
+    targets = _month_targets(by_month.keys())
+
+    # Pick the month that is furthest behind its target share so far. Weighting
+    # by the shortfall (rather than by the target itself) keeps the months that
+    # have plenty of media from clumping up in a single game.
+    by_rel = {e.rel: e for e in entries}
+    shown = Counter(by_rel[rel].month for rel in used_rel_paths if rel in by_rel)
+    picks_so_far = sum(shown.values())
+    months = list(by_month.keys())
+    weights = [max(0.0, targets[m] * (picks_so_far + 1) - shown[m]) for m in months]
+    if sum(weights) <= 0:
+        weights = [targets[m] for m in months]
+
+    month = random.choices(months, weights=weights, k=1)[0]
+    entry = random.choice(by_month[month])
+    return (entry.rel, entry.media_type, entry.age_days)
 
 
 def _pick_random_media() -> Optional[Tuple[str, str, int]]:
@@ -319,8 +514,11 @@ def _start_pending_pick_background():
     snapshot_game_id = STATE.game_id
 
     def worker():
+        # A library smaller than the queue keeps handing back files we already
+        # hold; give up after a few of those rather than spinning.
+        wasted_attempts = 0
         try:
-            while True:
+            while wasted_attempts < 20:
                 with STATE.lock:
                     if STATE.game_id != snapshot_game_id:
                         STATE.pending_preparing = False
@@ -347,7 +545,10 @@ def _start_pending_pick_background():
                         STATE.pending_preparing = False
                         return
                     rel = pick[0]
-                    if not any(rel == r for (r, _t, _a) in STATE.pending_queue):
+                    if any(rel == r for (r, _t, _a) in STATE.pending_queue):
+                        wasted_attempts += 1
+                    else:
+                        wasted_attempts = 0
                         STATE.pending_queue.append(pick)
                         # Maintain first pending_pick for backward compatibility
                         first_rel, first_type, _first_age = STATE.pending_queue[0]
@@ -585,7 +786,8 @@ def new_game():
         STATE.reset()
         STATE.active = True
     # Build queue outside lock to avoid blocking other endpoints for long
-    while True:
+    wasted_attempts = 0
+    while wasted_attempts < 20:
         with STATE.lock:
             if len(STATE.pending_queue) >= TARGET_PENDING:
                 break
@@ -602,7 +804,10 @@ def new_game():
             if STATE.game_id != snapshot_game_id:
                 break
             rel = pick[0]
-            if not any(rel == r for (r, _t, _a) in STATE.pending_queue):
+            if any(rel == r for (r, _t, _a) in STATE.pending_queue):
+                wasted_attempts += 1
+            else:
+                wasted_attempts = 0
                 STATE.pending_queue.append(pick)
                 # Maintain first pending_pick for backward compatibility
                 first_rel, first_type, _first_age = STATE.pending_queue[0]
@@ -628,7 +833,7 @@ def guess():
 
     try:
         guess_days = int(guess_days)
-        guess_days = max(0, min(365, guess_days))
+        guess_days = max(0, min(MAX_AGE_DAYS, guess_days))
     except Exception:
         return ("Invalid guess", 400)
 
@@ -766,8 +971,36 @@ def get_state():
             },
             "leaderboard": _public_leaderboard(),
             "baby_name": BABY_NAME,
+            "max_age_days": MAX_AGE_DAYS,
+            "max_age_months": MAX_AGE_MONTHS,
         }
         return jsonify(response)
+
+
+@app.route("/api/media_stats")
+def media_stats():
+    """How the library is spread across the age range, for pre-party sanity checks."""
+    entries = _media_index(force=request.args.get("refresh") == "1")
+    with _index_lock:
+        skipped = {kind: list(rels) for kind, rels in _index_skipped.items()}
+    counts = Counter(e.month for e in entries)
+    targets = _month_targets(counts.keys())
+    return jsonify({
+        "total_usable": len(entries),
+        "max_age_months": MAX_AGE_MONTHS,
+        "months": [
+            {
+                "month": m,
+                "count": counts.get(m, 0),
+                "share_of_rounds": round(targets.get(m, 0.0), 4),
+            }
+            for m in range(MAX_AGE_MONTHS)
+        ],
+        "skipped": {
+            "undatable": {"count": len(skipped["undatable"]), "examples": sorted(skipped["undatable"])[:20]},
+            "out_of_range": {"count": len(skipped["out_of_range"]), "examples": sorted(skipped["out_of_range"])[:20]},
+        },
+    })
 
 
 def _sanitize_username(name: str) -> str:
@@ -808,6 +1041,21 @@ def _generate_username() -> str:
         "Cub",
     ]
     return f"{random.choice(adjectives)}{random.choice(animals)}{random.randint(10, 99)}"
+
+
+def _warm_media_index() -> None:
+    """Probe the library up front so the first game doesn't wait on ffprobe."""
+    def worker():
+        try:
+            entries = _media_index(force=True)
+            print(f"[ageoguessr] media index ready: {len(entries)} files across {MAX_AGE_MONTHS} months")
+        except Exception as exc:
+            print(f"[ageoguessr] media index warm-up failed: {exc}")
+
+    threading.Thread(target=worker, name="media-index-warmup", daemon=True).start()
+
+
+_warm_media_index()
 
 
 if __name__ == "__main__":

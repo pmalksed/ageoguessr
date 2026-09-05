@@ -11,8 +11,9 @@ A tiny pastel web game for guessing a baby's age from random photos/videos.
 1. Ensure Python 3.10+ is installed.
 2. Put your media files into `media/` (images: .jpg/.jpeg/.png/.gif; videos: .mp4/.mov/.webm).
 3. Optionally set environment variables:
-   - `BIRTH_DATE` (YYYY-MM-DD, default `2024-01-01`) – used with file modified time to compute true age for scoring
+   - `BIRTH_DATE` (YYYY-MM-DD, default `2024-09-05`) – used with each file's capture time to compute true age for scoring
    - `MEDIA_DIR` (defaults to `./media`)
+   - `MAX_AGE_MONTHS` (default `24`) – how far the guess slider reaches; media older than this is skipped
    - `TURN_DURATION_SECONDS` (default `120`)
    - `TOTAL_ROUNDS` (default `50`)
 
@@ -28,14 +29,31 @@ Visit http://localhost:5000
 ## How it works
 
 - One global game at a time; 50 rounds by default, each ~2 minutes.
-- Server selects a random media file each round.
+- Server picks a media file each round, spread evenly over the age range (see below).
 - Players type `newgame` anywhere on the page to start a fresh game (clobbers previous).
-- Slider from 0–12 months (approx via 365 days). Hover/drag shows months + days approximation.
+- Slider from 0–24 months (approx via 730 days). Hover/drag shows months + days approximation.
 - Submitting a guess sends the selected day count to the server; guesses after the timer are ignored.
 - Scoring: `points = max(0, 100 - |guessDays - trueDays|)`.
 - Leaderboard always visible and updates as rounds resolve.
 
+## Even coverage of the age range
+
+Most people shoot far more of a newborn than of an 18-month-old, so picking a
+file uniformly at random would make the game mostly about month 0. Instead each
+month of life gets an equal share of the rounds no matter how many files it
+holds, and a month with no media at all donates its share to the nearest months
+that do have some. Within a game, a month that has already had its share sits
+out until the others catch up, so 50 rounds cover the two years fairly evenly.
+
+Visit `/api/media_stats` to see how many usable files you have per month, plus
+any files that were skipped for having no readable date or for falling outside
+the age range.
+
 ## Notes
 
-- Age is derived from `BIRTH_DATE` to each file's modification time. For finer accuracy, keep your files' mtimes aligned with capture time.
+- Age is derived from `BIRTH_DATE` to each file's capture time (EXIF for photos,
+  `ffprobe` for videos, falling back to a date parsed out of the filename).
+  Files with no discoverable date are skipped; `/api/media_stats` lists them.
+- Capture times are cached in `.media_index.json`, keyed by size and mtime, so
+  restarts only re-probe files that actually changed.
 - This is a cozy friends-only game; no auth, no persistence across restarts. 

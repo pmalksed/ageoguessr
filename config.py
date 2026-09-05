@@ -16,6 +16,21 @@ BIRTH_DATE = parse_birth_date(os.getenv("BIRTH_DATE", "2024-09-05"))
 # Where your photos and videos live
 MEDIA_DIR = os.getenv("MEDIA_DIR", os.path.abspath(os.path.join(os.path.dirname(__file__), "media")))
 
+# Age range the game covers: the guess slider spans it and media outside it is skipped
+MAX_AGE_MONTHS = int(os.getenv("MAX_AGE_MONTHS", "24"))
+DAYS_PER_MONTH = 365.0 / 12.0
+MAX_AGE_DAYS = int(round(MAX_AGE_MONTHS * DAYS_PER_MONTH))
+# Media captured a little past the top of the range (e.g. at the party itself)
+# still counts; it just gets clamped down to MAX_AGE_DAYS.
+AGE_GRACE_DAYS = int(os.getenv("AGE_GRACE_DAYS", "14"))
+
+# Remembers each file's capture time so restarts don't re-probe every video
+MEDIA_INDEX_PATH = os.getenv(
+    "MEDIA_INDEX_PATH", os.path.abspath(os.path.join(os.path.dirname(__file__), ".media_index.json"))
+)
+# Parallelism for the (slow) EXIF/ffprobe pass over new files
+MEDIA_PROBE_WORKERS = int(os.getenv("MEDIA_PROBE_WORKERS", "8"))
+
 # Game settings
 # Backwards compatibility: if TURN_DURATION_SECONDS is set, use it for video by default
 TURN_DURATION_SECONDS_VIDEO = int(os.getenv("TURN_DURATION_SECONDS", os.getenv("TURN_DURATION_SECONDS_VIDEO", "20")))

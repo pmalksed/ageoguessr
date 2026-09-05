@@ -1,3 +1,5 @@
 .venv/
 __pycache__/
 media/
+.media_index.json
+.media_index.json.tmp
