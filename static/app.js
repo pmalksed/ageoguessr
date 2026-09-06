@@ -324,7 +324,7 @@ function App() {
           React.createElement("div", { className: "media-box" },
             state?.game?.active && currentMediaSrc ? (
               currentMediaType === "video"
-                ? React.createElement("video", { src: currentMediaSrc, controls: true, autoPlay: true, loop: true })
+                ? React.createElement("video", { src: currentMediaSrc, controls: true, autoPlay: true, loop: true, muted: true, playsInline: true })
                 : React.createElement("img", { src: currentMediaSrc, alt: "current" })
             ) : (
               state?.game?.active ? React.createElement("div", null, "Loading media...") : null
