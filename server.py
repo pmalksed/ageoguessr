@@ -779,6 +779,22 @@ def change_username():
     return jsonify({"ok": True, "leaderboard": lb})
 
 
+@app.route("/api/endgame", methods=["POST"])
+def end_game():
+    """Stop the current game where it stands. Scores stay on the leaderboard
+    until the next newgame; the round and its media disappear immediately."""
+    with STATE.lock:
+        STATE.active = False
+        STATE.current_round = None
+        STATE.rounds_remaining = 0
+        # A fresh game_id makes any background queue worker exit on its next check
+        STATE.game_id = uuid.uuid4().hex
+        STATE.pending_queue = []
+        STATE.pending_pick = None
+        STATE.pending_preparing = False
+    return jsonify({"ok": True})
+
+
 @app.route("/api/newgame", methods=["POST"]) 
 def new_game():
     # Synchronously prepare the first TARGET_PENDING items so early rounds never wait
@@ -895,8 +911,9 @@ def set_ready():
 def get_state():
     with STATE.lock:
         _advance_if_needed_locked()
-        # Keep the pending queue filling in the background
-        _ensure_pending_queue_locked()
+        # Keep the pending queue filling in the background (newgame builds its own)
+        if STATE.active:
+            _ensure_pending_queue_locked()
         rnd = STATE.current_round
         if rnd and rnd.media_filename:
             version = f"{STATE.game_id}-{STATE.current_round_index}"

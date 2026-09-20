@@ -273,6 +273,9 @@ function App() {
       if (keyBufferRef.current === "newgame") {
         api("/api/newgame", { method: "POST", body: JSON.stringify({}) }).catch(() => {});
         keyBufferRef.current = "";
+      } else if (keyBufferRef.current === "endgame") {
+        api("/api/endgame", { method: "POST", body: JSON.stringify({}) }).catch(() => {});
+        keyBufferRef.current = "";
       }
     }
     window.addEventListener("keydown", onKey);
