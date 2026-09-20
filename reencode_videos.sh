@@ -90,6 +90,11 @@ for f in "${videos[@]}"; do
     skipped=$((skipped + 1))
     continue
   fi
+  # The output name is taken by a *different* original (e.g. IMG_1.mov and
+  # IMG_1.mp4 both exist): don't clobber it, give this one its own name.
+  if [ "$out" != "$f" ] && [ -e "$out" ] && ! already_done "$out"; then
+    out="$MEDIA_OUT/${stem}_${base##*.}.mp4"
+  fi
   # Converted on an earlier run but the source was left behind (interrupted
   # between the rename and the delete): finish the job.
   if [ "$out" != "$f" ] && already_done "$out"; then
