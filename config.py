@@ -45,4 +45,11 @@ ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif"}
 ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm"}
 
 # Display name for the baby used in UI prompts
-BABY_NAME = os.getenv("BABY_NAME", "Joy") 
+BABY_NAME = os.getenv("BABY_NAME", "Joy")
+
+# One shared password for the whole site (game, API, and media). Leave empty
+# to run wide open, e.g. for local development.
+GAME_PASSWORD = os.getenv("GAME_PASSWORD", "")
+# Signs the login cookie. Defaults to something derived from the password so
+# cookies survive a restart; set explicitly if you rotate the password often.
+SECRET_KEY = os.getenv("SECRET_KEY", "")

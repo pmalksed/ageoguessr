@@ -16,6 +16,7 @@ A tiny pastel web game for guessing a baby's age from random photos/videos.
    - `MAX_AGE_MONTHS` (default `24`) – how far the guess slider reaches; media older than this is skipped
    - `TURN_DURATION_SECONDS` (default `120`)
    - `TOTAL_ROUNDS` (default `50`)
+   - `GAME_PASSWORD` (default empty = no login) – one shared password for the whole site; see below
 
 ```bash
 python3 -m venv .venv
@@ -35,6 +36,20 @@ Visit http://localhost:5000
 - Submitting a guess sends the selected day count to the server; guesses after the timer are ignored.
 - Scoring: `points = max(0, 100 - |guessDays - trueDays|)`.
 - Leaderboard always visible and updates as rounds resolve.
+
+## Password
+
+A server on a public IP gets found by port scanners whether or not anyone
+links to it, and `/api/state` hands the current media URL to anyone who asks.
+Set `GAME_PASSWORD` and everything except the login page sits behind one
+shared password, remembered in a cookie for 60 days.
+
+The easiest way to let guests in is a one-tap link that logs them in and then
+drops the password from the address bar:
+
+    http://your-host:5000/?pw=THE_PASSWORD
+
+Type `endgame` on the page to stop a game in progress; `newgame` starts one.
 
 ## Even coverage of the age range
 

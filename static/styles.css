@@ -293,6 +293,37 @@ input[type="range"].has-guess::-moz-range-thumb {
   font-size: 12px;
 }
 
+/* Login page */
+.login-shell {
+  min-height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+}
+.login-card {
+  width: min(360px, 100%);
+  min-width: 0;
+  padding: 22px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  text-align: center;
+}
+.login-card .brand { font-size: 26px; }
+.login-hint { color: #7a3f73; font-weight: 600; font-size: 14px; }
+.login-card input {
+  padding: 10px 12px;
+  border: 2px solid #ffc6e7;
+  border-radius: 12px;
+  outline: none;
+  font-size: 16px;
+  text-align: center;
+}
+.login-card input:focus { border-color: #ff8fcf; }
+.login-card .ready-btn { padding: 10px 14px; font-size: 15px; }
+.login-error { color: #d0356f; font-weight: 700; font-size: 14px; }
+
 /* Mobile adjustments */
 .username-mobile { display: none; }
 

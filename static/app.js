@@ -28,8 +28,20 @@ function daysToMonthsDays(days, range = DEFAULT_RANGE) {
   return { months, days: remDays };
 }
 
+// The site password lives in a cookie; if it's gone (expired, cleared), the
+// server answers 401 and a reload lands on the login page.
+function bounceToLoginIf401(res) {
+  if (res.status === 401) {
+    window.location.reload();
+    return new Promise(() => {}); // never resolves; the page is going away
+  }
+  return null;
+}
+
 async function api(path, opts = {}) {
   const res = await fetch(path, { headers: { "Content-Type": "application/json" }, ...opts });
+  const bounce = bounceToLoginIf401(res);
+  if (bounce) return bounce;
   if (!res.ok) throw new Error("request failed");
   return await res.json();
 }
@@ -109,6 +121,8 @@ function App() {
     const cache = mediaCacheRef.current;
     if (cache.has(url)) return cache.get(url).blobUrl;
     const res = await fetch(url, { cache: "force-cache" });
+    const bounce = bounceToLoginIf401(res);
+    if (bounce) return bounce;
     if (!res.ok) throw new Error("media fetch failed");
     const blob = await res.blob();
     const blobUrl = URL.createObjectURL(blob);

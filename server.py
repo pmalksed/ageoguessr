@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import random
@@ -15,17 +17,19 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import re
 import subprocess
 
-from flask import Flask, jsonify, request, send_from_directory, render_template, make_response
+from flask import Flask, jsonify, request, send_from_directory, render_template, make_response, redirect, session
 
 from config import (
     AGE_GRACE_DAYS,
     BIRTH_DATE,
     DAYS_PER_MONTH,
+    GAME_PASSWORD,
     MAX_AGE_DAYS,
     MAX_AGE_MONTHS,
     MEDIA_DIR,
     MEDIA_INDEX_PATH,
     MEDIA_PROBE_WORKERS,
+    SECRET_KEY,
     TURN_DURATION_SECONDS_IMAGE,
     TURN_DURATION_SECONDS_VIDEO,
     TOTAL_ROUNDS,
@@ -44,6 +48,61 @@ except Exception:
     _EXIF_TAGS = {}
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
+
+# ---------------------------------------------------------------------------
+# Site password
+#
+# Everything except the login page and the stylesheet sits behind one shared
+# password, remembered in a signed cookie. Guests can be sent a link of the
+# form http://host:5000/?pw=PASSWORD that logs them in with a single tap.
+# ---------------------------------------------------------------------------
+app.secret_key = SECRET_KEY or hashlib.sha256(f"ageoguessr-cookie:{GAME_PASSWORD}".encode()).hexdigest()
+app.config.update(
+    PERMANENT_SESSION_LIFETIME=timedelta(days=60),
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+)
+
+
+def _password_ok(candidate: Optional[str]) -> bool:
+    return bool(GAME_PASSWORD) and hmac.compare_digest(candidate or "", GAME_PASSWORD)
+
+
+def _log_in() -> None:
+    session.permanent = True
+    session["authed"] = True
+
+
+@app.before_request
+def _require_password():
+    if not GAME_PASSWORD:
+        return None  # site runs open
+    if request.endpoint in ("login", "static"):
+        return None
+    if session.get("authed"):
+        return None
+    # One-tap link: /?pw=... logs in and drops the password from the URL
+    if request.path == "/" and "pw" in request.args:
+        if _password_ok(request.args.get("pw")):
+            _log_in()
+            return redirect("/")
+        return render_template("login.html", error="That link's password isn't right."), 401
+    if request.path == "/":
+        return render_template("login.html", error=None)
+    return ("Login required", 401)
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if not GAME_PASSWORD:
+        return redirect("/")
+    if request.method == "GET":
+        return redirect("/")
+    if _password_ok(request.form.get("password")):
+        _log_in()
+        return redirect("/")
+    time.sleep(0.5)  # take the edge off brute-forcing
+    return render_template("login.html", error="That's not it. Try again?"), 401
 
 
 # Reveal phase duration in seconds

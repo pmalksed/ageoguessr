@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex, nofollow" />
+    <title>ageoguessr</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="login-shell">
+      <form class="panel login-card" method="post" action="/login" autocomplete="off">
+        <div class="brand">ageoguessr</div>
+        <div class="login-hint">This one's just for friends and family. What's the password?</div>
+        <input
+          type="password"
+          name="password"
+          placeholder="password"
+          autofocus
+          autocapitalize="off"
+          autocorrect="off"
+          spellcheck="false"
+        />
+        <button type="submit" class="ready-btn">Let me in</button>
+        {% if error %}<div class="login-error">{{ error }}</div>{% endif %}
+      </form>
+    </div>
+  </body>
+</html>
